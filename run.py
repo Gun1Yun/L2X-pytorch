@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 from torchtext import datasets
 from torchtext.data.utils import get_tokenizer
@@ -17,7 +17,7 @@ from torchtext.vocab import build_vocab_from_iterator
 
 from tqdm.auto import tqdm
 
-from models import OriginalModel
+from models import OriginalModel, L2XModel
 
 ## Argument parser ##
 parser = argparse.ArgumentParser()
@@ -34,17 +34,35 @@ torch.manual_seed(SEED)
 max_len = 400
 vocab_size = 5000
 emb_size = 50
-batch_size = 128
+batch_size = 40
 filter_size = 250
 kernel_size = 3
 hidden_size = 250
-n_epochs = 10
-learning_rate = 1e-1
+n_epochs = 5
+learning_rate = 3e-6
 k = 10
 
 ## MODEL PATH ##
 OG_MODEL_PATH = "./ckpt/original.pt"
+L2X_MODEL_PATH = "./ckpt/l2x.pt"
 OG_DATA_PATH = "./data/"
+
+
+class ImdbDataset(Dataset):
+    def __init__(self, x, y):
+        super(ImdbDataset, self).__init__()
+        self.x = x
+        self.y = y
+
+    def __getitem__(self, index):
+        x_tensor = torch.tensor(self.x[index])
+        y_tensor = torch.tensor(self.y[index])
+        y_tensor = F.softmax(y_tensor, dim=-1)
+
+        return x_tensor, y_tensor
+
+    def __len__(self):
+        return len(self.x)
 
 
 def load_data(vocab_size, tokenizer):
@@ -92,17 +110,16 @@ def collate_batch(batch):
 
 
 def generate_original_prediction(train):
-    train_loader = DataLoader(
-        train_datasets, batch_size=batch_size, shuffle=False, collate_fn=collate_batch
-    )
-    val_loader = DataLoader(
-        val_datasets, batch_size=batch_size, shuffle=False, collate_fn=collate_batch
-    )
-
     original_model = OriginalModel(vocab_size, emb_size, filter_size, kernel_size, hidden_size)
     original_model.to(device)
 
     if train:
+        train_loader = DataLoader(
+            train_datasets, batch_size=batch_size, shuffle=True, collate_fn=collate_batch
+        )
+        val_loader = DataLoader(
+            val_datasets, batch_size=batch_size, shuffle=False, collate_fn=collate_batch
+        )
         criterion = nn.CrossEntropyLoss()
         optimizer = optim.Adam(original_model.parameters(), lr=learning_rate)
         # train
@@ -129,35 +146,133 @@ def generate_original_prediction(train):
     original_model.eval()
 
     with torch.no_grad():
-        train_preds = []
-        val_preds = []
+        train_preds, val_preds = [], []
+        x_train, y_train, x_val, y_val = [], [], [], []
+
+        train_loader = DataLoader(
+            train_datasets, batch_size=1000, shuffle=False, collate_fn=collate_batch
+        )
+        val_loader = DataLoader(
+            val_datasets, batch_size=1000, shuffle=False, collate_fn=collate_batch
+        )
 
         # predicts train
         for _, (label, text, offsets) in tqdm(enumerate(train_loader)):
             label, text, offsets = label.to(device), text.to(device), offsets.to(device)
             pred = original_model(text)
             train_preds.append(pred)
+            x_train.append(text)
+            y_train.append(label)
 
         # predicts validation
         for _, (label, text, offsets) in tqdm(enumerate(val_loader)):
             label, text, offsets = label.to(device), text.to(device), offsets.to(device)
             pred = original_model(text)
             val_preds.append(pred)
+            x_val.append(text)
+            y_val.append(label)
 
         train_preds = torch.cat(train_preds)
         val_preds = torch.cat(val_preds)
 
+        x_train = torch.cat(x_train)
+        y_train = torch.cat(y_train)
+        x_val = torch.cat(x_val)
+        y_val = torch.cat(y_val)
+
         train_preds = train_preds.detach().cpu().numpy().tolist()
         val_preds = val_preds.detach().cpu().numpy().tolist()
 
+        x_train = x_train.detach().cpu().numpy().tolist()
+        y_train = y_train.detach().cpu().numpy().tolist()
+        x_val = x_val.detach().cpu().numpy().tolist()
+        y_val = y_val.detach().cpu().numpy().tolist()
+
         train_path = os.path.join(OG_DATA_PATH, "train_preds.pkl")
         val_path = os.path.join(OG_DATA_PATH, "val_preds.pkl")
+
+        x_train_path = os.path.join(OG_DATA_PATH, "x_train.pkl")
+        y_train_path = os.path.join(OG_DATA_PATH, "y_train.pkl")
+        x_val_path = os.path.join(OG_DATA_PATH, "x_val.pkl")
+        y_val_path = os.path.join(OG_DATA_PATH, "y_val.pkl")
 
         with open(train_path, "wb") as f_train, open(val_path, "wb") as f_val:
             pickle.dump(train_preds, f_train)
             pickle.dump(val_preds, f_val)
 
+        with open(x_train_path, "wb") as f_x_train, open(y_train_path, "wb") as f_y_train, open(
+            x_val_path, "wb"
+        ) as f_x_val, open(y_val_path, "wb") as f_y_val:
+            pickle.dump(x_train, f_x_train)
+            pickle.dump(y_train, f_y_train)
+            pickle.dump(x_val, f_x_val)
+            pickle.dump(y_val, f_y_val)
+
         print(f"Generate OG prediction is finished. Saved predictions at {OG_DATA_PATH}")
+
+
+def L2X(train=True):
+    # for validation
+    train_loader = DataLoader(
+        train_datasets, batch_size=batch_size, shuffle=False, collate_fn=collate_batch
+    )
+    val_loader = DataLoader(
+        val_datasets, batch_size=batch_size, shuffle=False, collate_fn=collate_batch
+    )
+
+    train_path = os.path.join(OG_DATA_PATH, "train_preds.pkl")
+    val_path = os.path.join(OG_DATA_PATH, "val_preds.pkl")
+
+    x_train_path = os.path.join(OG_DATA_PATH, "x_train.pkl")
+    y_train_path = os.path.join(OG_DATA_PATH, "y_train.pkl")
+    x_val_path = os.path.join(OG_DATA_PATH, "x_val.pkl")
+    y_val_path = os.path.join(OG_DATA_PATH, "y_val.pkl")
+
+    with open(train_path, "rb") as f_train, open(val_path, "rb") as f_val:
+        train_preds = pickle.load(f_train)
+        val_preds = pickle.load(f_val)
+
+    with open(x_train_path, "rb") as f_x_train, open(y_train_path, "rb") as f_y_train, open(
+        x_val_path, "rb"
+    ) as f_x_val, open(y_val_path, "rb") as f_y_val:
+        x_train = pickle.load(f_x_train)
+        y_train = pickle.load(f_y_train)
+        x_val = pickle.load(f_x_val)
+        y_val = pickle.load(f_y_val)
+
+    if train:
+        l2x_model = L2XModel(vocab_size, emb_size, kernel_size, hidden_size, k)
+        l2x_model.to(device)
+
+        l2x_train_dataset = ImdbDataset(x_train, train_preds)
+        l2x_val_dataset = ImdbDataset(x_val, val_preds)
+        l2x_train_loader = DataLoader(l2x_train_dataset, batch_size=batch_size, shuffle=True)
+        l2x_val_loader = DataLoader(l2x_val_dataset, batch_size=batch_size, shuffle=True)
+
+        l2x_model.train()
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.Adam(l2x_model.parameters(), lr=learning_rate)
+
+        for epoch in range(1, 1 + n_epochs):
+            print(f"Epoch [{epoch}/{n_epochs}] : ", end="")
+            total_acc, total_count, total_loss = 0, 0, 0
+            for _, (text, label) in tqdm(enumerate(l2x_train_loader)):
+                optimizer.zero_grad()
+                text, label = text.to(device), label.to(device)
+                pred = l2x_model(text)
+                loss = criterion(pred, label)
+                loss.backward()
+                optimizer.step()
+                total_acc += (pred.argmax(1) == label.argmax(1)).sum().item()
+                total_count += label.size(0)
+                total_loss += loss.item()
+            print(f"Acc : {total_acc/total_count}, Loss : {total_loss/len(l2x_train_loader)}")
+
+        torch.save(l2x_model.state_dict(), L2X_MODEL_PATH)
+        print(f"Train L2X model is finished. saved L2X Model at {L2X_MODEL_PATH}.")
+
+    l2x_model.load_state_dict(torch.load(L2X_MODEL_PATH), strict=False)
+    l2x_model.eval()
 
 
 if __name__ == "__main__":
@@ -171,4 +286,4 @@ if __name__ == "__main__":
         generate_original_prediction(args.train)
 
     elif args.task == "L2X":
-        pass
+        L2X(args.train)
