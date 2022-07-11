@@ -18,6 +18,7 @@ from torchtext.vocab import build_vocab_from_iterator
 from tqdm.auto import tqdm
 
 from models import OriginalModel, L2XModel
+from utils import create_dataset_from_score
 
 ## Argument parser ##
 parser = argparse.ArgumentParser()
@@ -39,13 +40,14 @@ filter_size = 250
 kernel_size = 3
 hidden_size = 250
 n_epochs = 5
-learning_rate = 3e-6
+learning_rate = 1e-2
 k = 10
 
 ## MODEL PATH ##
 OG_MODEL_PATH = "./ckpt/original.pt"
 L2X_MODEL_PATH = "./ckpt/l2x.pt"
 OG_DATA_PATH = "./data/"
+VOCAB_PATH = "./data/"
 
 
 class ImdbDataset(Dataset):
@@ -82,6 +84,14 @@ def load_data(vocab_size, tokenizer):
     )
     vocab.set_default_index(vocab["<unk>"])
 
+    vocab_path = os.path.join(VOCAB_PATH, "vocab.pkl")
+    if os.path.isfile(vocab_path):
+        with open(vocab_path, "rb") as f_vocab:
+            vocab = pickle.load(f_vocab)
+    else:
+        with open(vocab_path, "wb") as f_vocab:
+            pickle.dump(vocab, f_vocab)
+
     return train_dataset, test_dataset, vocab
 
 
@@ -100,6 +110,7 @@ def collate_batch(batch):
         processed_text = torch.tensor(
             truncate(text_pipeline(_text), max_seq_len=max_len), dtype=torch.int64
         )
+        processed_text = nn.ConstantPad1d((0, max_len - processed_text.size(0)), 0)(processed_text)
         text_list.append(processed_text)
         offsets.append(processed_text.size(0))
     label_list = torch.tensor(label_list, dtype=torch.int64)
@@ -110,7 +121,9 @@ def collate_batch(batch):
 
 
 def generate_original_prediction(train):
-    original_model = OriginalModel(vocab_size, emb_size, filter_size, kernel_size, hidden_size)
+    original_model = OriginalModel(
+        vocab_size, max_len, emb_size, filter_size, kernel_size, hidden_size
+    )
     original_model.to(device)
 
     if train:
@@ -127,6 +140,7 @@ def generate_original_prediction(train):
         for epoch in range(1, 1 + n_epochs):
             print(f"Epoch [{epoch}/{n_epochs}] : ", end="")
             total_acc, total_count, total_loss = 0, 0, 0
+            steps = 0
             for _, (label, text, offsets) in tqdm(enumerate(train_loader)):
                 optimizer.zero_grad()
                 label, text, offsets = label.to(device), text.to(device), offsets.to(device)
@@ -137,7 +151,8 @@ def generate_original_prediction(train):
                 total_acc += (predicted_label.argmax(1) == label).sum().item()
                 total_count += label.size(0)
                 total_loss += loss.item()
-            print(f"Acc : {total_acc/total_count}")
+                steps += 1
+            print(f"Acc : {total_acc/total_count} Loss : {total_loss/steps}")
 
         torch.save(original_model.state_dict(), OG_MODEL_PATH)
         print(f"Train OG model is finished. saved OGmodel at {OG_MODEL_PATH}.")
@@ -240,9 +255,10 @@ def L2X(train=True):
         x_val = pickle.load(f_x_val)
         y_val = pickle.load(f_y_val)
 
+    l2x_model = L2XModel(vocab_size, emb_size, kernel_size, hidden_size, k)
+    l2x_model.to(device)
+
     if train:
-        l2x_model = L2XModel(vocab_size, emb_size, kernel_size, hidden_size, k)
-        l2x_model.to(device)
 
         l2x_train_dataset = ImdbDataset(x_train, train_preds)
         l2x_val_dataset = ImdbDataset(x_val, val_preds)
@@ -274,11 +290,31 @@ def L2X(train=True):
     l2x_model.load_state_dict(torch.load(L2X_MODEL_PATH), strict=False)
     l2x_model.eval()
 
+    val_loader = DataLoader(val_datasets, batch_size=1000, shuffle=False, collate_fn=collate_batch)
+
+    with torch.no_grad():
+        x_val, scores = [], []
+        for _, (label, text, offsets) in tqdm(enumerate(val_loader)):
+            label, text = label.to(device), text.to(device)
+            pred = l2x_model.selector(text)
+            score = l2x_model.selector.logits
+            x_val.append(text)
+            scores.append(score)
+
+        x_val = torch.cat(x_val)
+        scores = torch.cat(scores)
+        scores = scores.reshape(scores.shape[0], -1)
+
+    x_val = x_val.detach().cpu().numpy().tolist()
+    scores = scores.detach().cpu().numpy().tolist()
+
+    return x_val, scores
+
 
 if __name__ == "__main__":
     args = parser.parse_args()
 
-    device = torch.device("cuda")
+    device = torch.device("cuda:3")
     tokenizer = get_tokenizer("basic_english")
     train_datasets, val_datasets, vocab = load_data(vocab_size, tokenizer)
 
@@ -286,4 +322,5 @@ if __name__ == "__main__":
         generate_original_prediction(args.train)
 
     elif args.task == "L2X":
-        L2X(args.train)
+        x_val, scores = L2X(args.train)
+        create_dataset_from_score(x_val, scores, vocab, k, max_len)
