@@ -5,7 +5,13 @@ import torch.nn.functional as F
 
 class OriginalModel(nn.Module):
     def __init__(
-        self, vocab_size: int, emb_size: int, filter_size: int, kernel_size: int, hidden_size: int
+        self,
+        vocab_size: int,
+        max_len: int,
+        emb_size: int,
+        filter_size: int,
+        kernel_size: int,
+        hidden_size: int,
     ):
         """Original Model to explain
         original model for generate prediction
@@ -19,9 +25,9 @@ class OriginalModel(nn.Module):
         """
         super(OriginalModel, self).__init__()
         self.embedding = nn.Embedding(vocab_size, emb_size)
-        self.conv1d = nn.Conv1d(emb_size, filter_size, kernel_size)
+        self.conv1d = nn.Conv1d(max_len, filter_size, kernel_size)
         self.max_pooling = nn.AdaptiveMaxPool1d(1)
-        self.linear1 = nn.Linear(filter_size, hidden_size)
+        self.linear1 = nn.Linear(emb_size - 2, hidden_size)
         self.linear2 = nn.Linear(hidden_size, 2)
         self.dropout1 = nn.Dropout(0.2)
         self.dropout2 = nn.Dropout(0.2)
@@ -29,10 +35,10 @@ class OriginalModel(nn.Module):
     def forward(self, x):
         x = self.embedding(x)
         x = self.dropout1(x)
-        x = self.conv1d(x.transpose(1, 2))
+        x = self.conv1d(x)
         x = F.relu(x)
-        x = self.max_pooling(x)
-        x = self.linear1(x.squeeze(axis=-1))
+        x = self.max_pooling(x.transpose(1, 2)).squeeze(2)
+        x = self.linear1(x)
         x = self.dropout2(x)
         x = F.relu(x)
         x = self.linear2(x)
@@ -47,7 +53,7 @@ class Selector(nn.Module):
 
     def __init__(self, vocab_size: int, emb_size: int, kernel_size: int):
         super(Selector, self).__init__()
-        self.tau = 0.1
+        self.tau = 0.5
         self.k = 10  # select constraint
         self.uniform_dist = torch.distributions.uniform.Uniform(
             torch.tensor([0.0]), torch.tensor([1.0])
@@ -58,11 +64,11 @@ class Selector(nn.Module):
         self.dropout = nn.Dropout(0.2)
         self.conv1d = nn.Conv1d(emb_size, 100, kernel_size, padding="same")
 
-        # glob
+        # glob info
         self.glob_max_pooling = nn.AdaptiveMaxPool1d(1)
         self.glob_linear = nn.Linear(100, 100)
 
-        # local
+        # local info
         self.local_conv1d = nn.Conv1d(100, 100, 3, padding="same")
         self.local_info_conv1d = nn.Conv1d(100, 100, 3, padding="same")
 
@@ -71,17 +77,24 @@ class Selector(nn.Module):
         self.final_conv1d = nn.Conv1d(200, 100, 1, padding="same")  # output channel x2
         self.final_conv1d2 = nn.Conv1d(100, 1, 1, padding="same")
 
+        # for save logits
+        self.logits = None
+
     def forward(self, x):
         x = self.embeddings(x)
         x = self.dropout(x)
 
         x_base = self.conv1d(x.transpose(1, 2))
+        x_base = F.relu(x_base)
 
         global_x = self.glob_max_pooling(x_base)
         global_x = self.glob_linear(global_x.squeeze(axis=-1))
+        global_x = F.relu(global_x)
 
         local_x = self.local_conv1d(x_base)
+        local_x = F.relu(local_x)
         local_x = self.local_info_conv1d(local_x)
+        local_x = F.relu(local_x)
         local_x = local_x.transpose(1, 2)
 
         # combine
@@ -93,14 +106,17 @@ class Selector(nn.Module):
         # output
         output = self.dropout2(combined)
         output = self.final_conv1d(output.transpose(1, 2))
+        output = F.relu(output)
         output = self.final_conv1d2(output)
 
-        # model.train()
+        self.logits = output
+
+        # when model.train()
         if self.training:
             # sampling with geumbel softmax
             samples = self._gumbel_softmax(output)
             return samples
-        # model.eval()
+        # when model.eval()
         else:
             # make threshold for top k and make discrete
             threshold = torch.topk(output, self.k, sorted=True)[0][:, -1].unsqueeze(-1)
@@ -109,9 +125,7 @@ class Selector(nn.Module):
             )
             return discreate_output
 
-    # make this to tensor
     def _gumbel_softmax(self, logits):
-        # logits : batch, 1, len(x)
         dim = logits.shape[-1]
         uniform_shape = torch.Size([logits.shape[0], self.k, dim])
         uniform_sampled = (
